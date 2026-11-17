@@ -1,0 +1,163 @@
+#cloud-config
+# Шаблон рендерится Terraform'ом (templatefile). Поэтому:
+#   $${var}   — подстановка Terraform; в shell используем $VAR без фигурных скобок
+#   %%{ for } — директивы Terraform (for/if)
+# (в этом комментарии они экранированы как $$ и %% — templatefile парсит и комментарии)
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gpg
+  # conntrack: kube-proxy и kubelet используют таблицу conntrack (NAT для Service);
+  # kubeadm preflight проверяет наличие бинарника.
+  - conntrack
+  # socat: нужен для `kubectl port-forward`.
+  - socat
+  # ipset/ipvsadm: если позже переключишь kube-proxy в режим IPVS или CNI их использует.
+  - ipset
+
+# /etc/hosts дописываем сами (см. скрипт). Без этого cloud-init может
+# перезаписать файл при следующих загрузках.
+manage_etc_hosts: false
+
+write_files:
+  # ---------------------------------------------------------------------------
+  # 1. Модули ядра.
+  # overlay      — snapshotter containerd по умолчанию: слои образа монтируются
+  #                как overlayfs. Без модуля контейнеры не стартуют.
+  # br_netfilter — заставляет трафик, идущий через Linux bridge (veth подов ->
+  #                cni0/cbr0), проходить через iptables/nftables. Без него правила
+  #                kube-proxy (DNAT ClusterIP -> PodIP) не срабатывают для трафика
+  #                pod->service на той же ноде, и Service "иногда не работает".
+  # ---------------------------------------------------------------------------
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  # ---------------------------------------------------------------------------
+  # 2. sysctl.
+  # ip_forward = 1               — нода работает как роутер: пакеты для подов
+  #                                приходят на eth/enp и форвардятся в veth/туннель.
+  #                                Без этого cross-node трафик подов умирает.
+  #                                kubeadm preflight падает, если = 0.
+  # bridge-nf-call-ip(6)tables=1 — включает обработку bridged-трафика в iptables
+  #                                (работает только при загруженном br_netfilter).
+  # ---------------------------------------------------------------------------
+  - path: /etc/sysctl.d/99-kubernetes.conf
+    content: |
+      net.ipv4.ip_forward                 = 1
+      net.ipv6.conf.all.forwarding        = 1
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      # Много подов = много inotify watchers (kubelet, логи, containerd).
+      fs.inotify.max_user_watches   = 524288
+      fs.inotify.max_user_instances = 512
+
+  # crictl — CLI для дебага на уровне CRI (аналог `docker ps` для containerd).
+  - path: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+
+  # Основной скрипт подготовки: так проще дебажить (можно перезапустить руками),
+  # а лог виден в /var/log/k8s-node-prep.log.
+  - path: /usr/local/sbin/k8s-node-prep.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # --- 3. Swap off -------------------------------------------------------
+      # kubelet по умолчанию (failSwapOn: true) отказывается стартовать при
+      # включённом swap: планировщик считает память по requests/limits, а swap
+      # ломает эту модель (OOM-поведение, QoS). Образы Hetzner обычно без swap,
+      # но выключаем явно и комментируем в fstab, чтобы не вернулся после ребута.
+      swapoff -a
+      sed -ri '/\sswap\s/s/^#?/#/' /etc/fstab
+
+      # --- Применяем модули и sysctl прямо сейчас (файлы — для ребутов) -------
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      # --- 4. containerd 2.x из репозитория Docker ---------------------------
+      # Kubernetes 1.35 — последняя версия с поддержкой containerd 1.x; с 1.36
+      # нужен containerd 2.x. Пакет containerd.io из репо Docker даёт 2.x
+      # предсказуемо на любой Ubuntu LTS.
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+      # --- 5. kubeadm/kubelet/kubectl из pkgs.k8s.io -------------------------
+      # Репозиторий привязан к МИНОРНОЙ версии (v1.36). Это защита от случайного
+      # прыжка на следующий минор через apt upgrade: kubeadm поддерживает
+      # апгрейд только на +1 минор и только через `kubeadm upgrade`.
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/${kubernetes_minor}/deb/Release.key \
+        | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${kubernetes_minor}/deb/ /" \
+        > /etc/apt/sources.list.d/kubernetes.list
+
+      apt-get update
+      apt-get install -y containerd.io kubelet kubeadm kubectl
+
+      # hold: unattended-upgrades/apt upgrade не должны обновлять компоненты
+      # кластера в обход `kubeadm upgrade` (порядок: control plane -> kubelet на
+      # каждой ноде с drain). containerd тоже держим — его рестарт рестартует
+      # все контейнеры ноды.
+      apt-mark hold kubelet kubeadm kubectl containerd.io
+
+      # --- 6. Конфиг containerd ----------------------------------------------
+      # Пакет Docker кладёт config.toml с disabled_plugins = ["cri"] — для Docker
+      # CRI не нужен, а kubelet общается с containerd ТОЛЬКО через CRI.
+      # Генерируем полный дефолтный конфиг (CRI включён).
+      mkdir -p /etc/containerd
+      containerd config default > /etc/containerd/config.toml
+
+      # SystemdCgroup = true: на Ubuntu init-система — systemd и cgroup v2.
+      # Если kubelet/containerd управляют cgroups через cgroupfs, а systemd —
+      # через свой драйвер, получаются два "менеджера" одной иерархии -> нестабильность
+      # под нагрузкой памяти. С k8s 1.34+ kubelet сам берёт cgroup driver из CRI,
+      # поэтому достаточно выставить его в containerd.
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      grep -q 'SystemdCgroup = true' /etc/containerd/config.toml
+
+      systemctl enable containerd
+      systemctl restart containerd
+
+      # --- 7. kubelet: слушать приватный IP ----------------------------------
+      # У VM два интерфейса: публичный (default route) и private network.
+      # Без --node-ip kubelet зарегистрирует ноду с ПУБЛИЧНЫМ IP, и API server,
+      # metrics, CNI будут гонять трафик через интернет (и упираться в firewall).
+      # Drop-in 10-kubeadm.conf читает этот файл как EnvironmentFile.
+      echo "KUBELET_EXTRA_ARGS=--node-ip=${node_private_ip}" > /etc/default/kubelet
+
+      # kubelet будет в crashloop до `kubeadm init/join` — это нормально:
+      # у него ещё нет /var/lib/kubelet/config.yaml.
+      systemctl enable kubelet
+
+      # --- 8. /etc/hosts: имена нод -> приватные IP --------------------------
+      if ! grep -q 'BEGIN k8s-nodes' /etc/hosts; then
+        cat >> /etc/hosts <<'EOF'
+      # BEGIN k8s-nodes
+%{ for name, ip in hosts ~}
+      ${ip} ${name}
+%{ endfor ~}
+      # END k8s-nodes
+      EOF
+      fi
+
+      touch /var/lib/k8s-node-prep.done
+      echo "k8s node prep finished"
+
+runcmd:
+  # pipefail — чтобы ошибка скрипта не "проглотилась" tee и cloud-init status показал error.
+  - [bash, -c, "set -o pipefail; /usr/local/sbin/k8s-node-prep.sh 2>&1 | tee /var/log/k8s-node-prep.log"]
